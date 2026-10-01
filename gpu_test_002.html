@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SANVI GPU TEST 002</title>
+<style>
+:root{--bg:#F4F5FA;--card:#fff;--ink:#1A1D2E;--mute:#666B88;--ok:#1E8E5A;--bad:#C0392B;--acc:#4B5BD6;--line:#DDE0EE;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root{--bg:#10121C;--card:#1A1D2E;--ink:#ECEEFA;--mute:#9A9FC0;--ok:#4CD08A;--bad:#FF7A6B;--acc:#8793FF;--line:#2B3050}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:14px}
+h1{font-size:1.2rem;margin:0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:10px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px}h2{font-size:1rem;margin:0}
+button{font:inherit;border:0;border-radius:10px;padding:8px 14px;background:var(--acc);color:#fff;font-weight:600;margin:4px 6px 0 0}button:disabled{opacity:.5}
+.st{font-weight:700;font-size:.85rem}.PASS{color:var(--ok)}.FAIL,.ERROR{color:var(--bad)}.RUNNING{color:var(--acc)}.STOPPED,.LIMIT{color:var(--mute)}
+.bar{height:6px;background:var(--line);border-radius:4px;margin:8px 0 4px}.bar i{display:block;height:100%;width:0;background:var(--acc);border-radius:4px}
+pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,monospace;margin:6px 0 0}.s{color:var(--mute);font-size:.8rem}input{width:70px;font:inherit;padding:4px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+</style></head><body><main>
+<h1>SANVI GPU TEST 002</h1><div class="s">Measurements only. Nothing here proves LLM speed. Memory probes are capped conservatively; close other heavy tabs before testing.</div>
+<div class="card"><button id="all">Run all</button><button id="stop">Stop</button><button id="cp">Copy report</button>
+<div class="s" style="margin-top:6px">Memory cap (MB) <input id="cap" type="number" value="128" min="32" max="256"> Sustained iterations <input id="its" type="number" value="30" min="30" max="300"></div>
+<pre id="hdr"></pre></div>
+<div id="cards"></div>
+<script>
+const $=id=>document.getElementById(id),U=GPUBufferUsage,MB=1048576;
+const NAMES=['FP16 vs FP32 (512x512)','Practical GPU memory','Sustained compute (512x512 FP32)','CPU vs GPU'];
+let dev,ad,stop=false,busy=false,errs=0,lost=false,H=[],T={},live=new Set();
+NAMES.forEach((n,i)=>{$('cards').insertAdjacentHTML('beforeend',`<div class="card"><div class="row"><h2>${i+1}. ${n}</h2><span class="st" id="s${i}">IDLE</span></div><button data-i="${i}">Run</button><div class="bar"><i id="b${i}"></i></div><div class="s" id="p${i}"></div><pre id="d${i}"></pre></div>`)});
+const setS=(i,s)=>{$('s'+i).textContent=s;$('s'+i).className='st '+s};
+const prog=(i,p,t)=>{$('b'+i).style.width=p+'%';$('p'+i).textContent=t||''};
+const out=(i,l)=>{(T[i]=T[i]||[]).push(l);$('d'+i).textContent=T[i].join('\n')};
+const sleep=()=>new Promise(r=>setTimeout(r,0));
+function st(a){const s=[...a].sort((x,y)=>x-y),n=s.length,m=a.reduce((x,y)=>x+y,0)/n;return{avg:m,med:n%2?s[n>>1]:(s[n/2-1]+s[n/2])/2,min:s[0],max:s[n-1],sd:Math.sqrt(a.reduce((x,y)=>x+(y-m)**2,0)/n)}}
+const f=(x,d=2)=>Number.isFinite(x)?x.toFixed(d):String(x);
+function makeBuffer(desc){const b=dev.createBuffer(desc);live.add(b);return b}
+function dropBuffer(b){if(!b)return;try{b.destroy()}catch(e){}live.delete(b)}
+function cleanup(){for(const b of [...live])dropBuffer(b)}
+function checkStop(){if(stop)throw Error('STOPPED');if(lost)throw Error('DEVICE_LOST')}
+async function init(){if(dev)return;if(!navigator.gpu)throw Error('WebGPU unavailable (needs HTTPS and Chrome)');
+ad=await navigator.gpu.requestAdapter();if(!ad)throw Error('No adapter');
+const fe=ad.features.has('shader-f16')?['shader-f16']:[];dev=await ad.requestDevice({requiredFeatures:fe});
+dev.lost.then(i=>{lost=true;H.push('DEVICE LOST: '+i.message);$('hdr').textContent=H.join('\n')});
+dev.onuncapturederror=e=>{errs++;H.push('GPU error: '+e.error.message);$('hdr').textContent=H.join('\n')};
+const i=ad.info||{},L=ad.limits;H=['SANVI-HW-002 | '+new Date().toLocaleString(),'UA: '+navigator.userAgent,'Adapter: '+[i.vendor,i.architecture,i.device].filter(Boolean).join(' / '),
+'maxBuffer '+(L.maxBufferSize/MB|0)+' MB, maxStorageBinding '+(L.maxStorageBufferBindingSize/MB|0)+' MB, shader-f16 '+ad.features.has('shader-f16')+', Float16Array '+(typeof Float16Array!=='undefined')];$('hdr').textContent=H.join('\n')}
+function buf(d,u){const b=makeBuffer({size:(d.byteLength+3)&~3,usage:u,mappedAtCreation:true});new d.constructor(b.getMappedRange()).set(d);b.unmap();return b}
+async function rd(src,bytes,off=0){const r=makeBuffer({size:bytes,usage:U.MAP_READ|U.COPY_DST}),e=dev.createCommandEncoder();e.copyBufferToBuffer(src,off,r,0,bytes);dev.queue.submit([e.finish()]);await r.mapAsync(GPUMapMode.READ);const a=r.getMappedRange().slice(0);r.unmap();r.destroy();return a}
+function mmP(n,m){const t=m==='f32'?'f32':'f16',h=m==='f32'?'':'enable f16;\n';
+const body=m==='f32'?'var s=0.0;for(var k=0u;k<N;k++){s+=A[r*N+k]*B[k*N+c];}C[r*N+c]=s;':m==='f16'?'var s:f16=0.0h;for(var k=0u;k<N;k++){s+=A[r*N+k]*B[k*N+c];}C[r*N+c]=s;':'var s:f32=0.0;for(var k=0u;k<N;k++){s+=f32(A[r*N+k])*f32(B[k*N+c]);}C[r*N+c]=f16(s);';
+return dev.createComputePipeline({layout:'auto',compute:{module:dev.createShaderModule({code:h+`const N:u32=${n}u;@group(0)@binding(0) var<storage,read> A:array<${t}>;@group(0)@binding(1) var<storage,read> B:array<${t}>;@group(0)@binding(2) var<storage,read_write> C:array<${t}>;@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let c=g.x;if(r>=N||c>=N){return;}${body}}`}),entryPoint:'main'}})}
+const bgOf=(p,bs)=>dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:bs.map((b,i)=>({binding:i,resource:{buffer:b}}))});
+async function run1(p,bg,n){const e=dev.createCommandEncoder(),ps=e.beginComputePass();ps.setPipeline(p);ps.setBindGroup(0,bg);ps.dispatchWorkgroups(n/8,n/8);ps.end();const t0=performance.now();dev.queue.submit([e.finish()]);await dev.queue.onSubmittedWorkDone();return performance.now()-t0}
+const gen=(n,T)=>{const A=new T(n*n),B=new T(n*n);for(let i=0;i<n*n;i++){A[i]=(i%13)/13;B[i]=(i%11)/11}return[A,B]};
+function maxErr(A,B,C,n){let m=0;for(let q=0;q<32;q++){const r=(q*37+5)%n,c=(q*91+11)%n;let s=0;for(let k=0;k<n;k++)s+=A[r*n+k]*B[k*n+c];m=Math.max(m,Math.abs(C[r*n+c]-s)/Math.max(1,Math.abs(s)))}return m}
+// TEST 1
+async function t1(){if(!ad.features.has('shader-f16'))throw Error('shader-f16 not available');if(typeof Float16Array==='undefined')throw Error('Float16Array missing in this Chrome');
+const n=512,res={};let ok=true;
+const modes=[['FP32','f32'],['FP16 pure (f16 accumulate)','f16'],['FP16 in, FP32 accumulate','mix']];
+for(let j=0;j<modes.length;j++){checkStop();const[name,m]=modes[j];prog(0,j*33,name);
+const T=m==='f32'?Float32Array:Float16Array,[A,B]=gen(n,T),bA=buf(A,U.STORAGE),bB=buf(B,U.STORAGE),bC=makeBuffer({size:n*n*(m==='f32'?4:2),usage:U.STORAGE|U.COPY_SRC});
+const p=mmP(n,m),bg=bgOf(p,[bA,bB,bC]);await run1(p,bg,n);await run1(p,bg,n);const ts=[];for(let i=0;i<9;i++){ts.push(await run1(p,bg,n));await sleep()}
+const C=new T(await rd(bC,n*n*(m==='f32'?4:2))),e=maxErr(A,B,C,n),s=st(ts);res[m]={med:s.med,e};
+out(0,`${name}: median ${f(s.med,1)} ms (avg ${f(s.avg,1)}, min ${f(s.min,1)}, max ${f(s.max,1)}, sd ${f(s.sd,1)}) | max rel err ${e.toExponential(2)}`);
+if(!Number.isFinite(e))ok=false;if(m==='f16')fp16Finite=Number.isFinite(e);if((m==='f32'&&e>1e-4)||(m==='mix'&&e>5e-3))ok=false;[bA,bB,bC].forEach(b=>b.destroy())}
+out(0,`Pure FP16 sampled error is reported for analysis, not assigned an arbitrary PASS threshold. Finite result: ${fp16Finite}`);
+out(0,`Speed vs FP32: pure FP16 x${f(res.f32.med/res.f16.med)}, mixed x${f(res.f32.med/res.mix.med)}`);
+out(0,`Precision evidence: FP32 err ${res.f32.e.toExponential(1)} vs FP16 err ${res.f16.e.toExponential(1)}. This shows 16-bit values, not which hardware unit ran them.`);
+return ok}
+// TEST 2
+function wpipe(seed){return dev.createComputePipeline({layout:'auto',compute:{module:dev.createShaderModule({code:`const SEED:u32=${seed}u;@group(0)@binding(0) var<storage,read_write> d:array<u32>;@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) g:vec3<u32>,@builtin(num_workgroups) nw:vec3<u32>){let st=nw.x*256u;var i=g.x;let n=arrayLength(&d);while(i<n){d[i]=(i+SEED)*2654435761u;i=i+st;}}`}),entryPoint:'main'}})}
+async function mkFill(mb,seed){dev.pushErrorScope('out-of-memory');dev.pushErrorScope('validation');
+const b=makeBuffer({size:mb*MB,usage:U.STORAGE|U.COPY_SRC});const v=await dev.popErrorScope(),o=await dev.popErrorScope();if(v||o){b.destroy();throw Error((o||v).message||'alloc failed')}
+const p=wpipe(seed),e=dev.createCommandEncoder(),ps=e.beginComputePass();ps.setPipeline(p);ps.setBindGroup(0,bgOf(p,[b]));ps.dispatchWorkgroups(1024);ps.end();dev.queue.submit([e.finish()]);await dev.queue.onSubmittedWorkDone();return b}
+async function chk(b,mb,seed){const w=mb*MB/4,offs=[0,(w>>1)*4,mb*MB-4096];let bad=0;
+for(const o of offs){const a=new Uint32Array(await rd(b,4096,o)),s=o/4;for(let i=0;i<1024;i++)if(a[i]!==(Math.imul(s+i+seed,2654435761)>>>0))bad++}return bad}
+async function t2(){
+const cap=Math.max(32,Math.min(+$('cap').value||128,256,Math.floor(dev.limits.maxStorageBufferBindingSize/MB))),tiers=[16,32,64,128,256].filter(x=>x<=cap);
+let ok=true,best=0,limitHit=false;
+out(1,`Configured total allocation cap: ${cap} MB. Single-buffer probes will not exceed this cap.`);
+for(const mb of tiers){
+checkStop();prog(1,10,'single '+mb+' MB');
+let b=null;
+try{b=await mkFill(mb,7);const bad=await chk(b,mb,7);if(bad){out(1,`Single ${mb} MB: INTEGRITY FAIL (${bad} bad words)`);ok=false;break}
+best=mb;out(1,`Single ${mb} MB: allocated and spot-checks passed`)}
+catch(e){if(stop||lost)throw e;limitHit=true;out(1,`Single ${mb} MB: allocation limit reached (${e.message}). Larger single probes skipped.`);break}
+finally{if(b)dropBuffer(b)}
+await sleep()
+}
+out(1,`Largest verified single buffer: ${best} MB (API binding limit ${Math.floor(dev.limits.maxStorageBufferBindingSize/MB)} MB)`);
+const keep=[];let tot=0,seed=1;
+try{
+while(tot+32<=cap){
+checkStop();prog(1,40+tot/cap*55,`simultaneous ${tot+32} MB`);
+let b;
+try{b=await mkFill(32,seed)}catch(e){if(stop||lost)throw e;limitHit=true;out(1,`Simultaneous allocation boundary at ${tot} MB: ${e.message}`);break}
+keep.push([b,seed]);tot+=32;
+if(await chk(b,32,seed)){out(1,`Integrity FAIL at ${tot} MB`);ok=false;break}
+seed++;await sleep()
+}
+let bad=0;for(const[b,sd]of keep){checkStop();bad+=await chk(b,32,sd)}
+out(1,`Simultaneous: ${tot} MB across ${keep.length} buffers; recheck ${bad?bad+' bad words':'all spot-checks intact'} (cap ${cap} MB)`);
+if(bad)ok=false
+}finally{keep.forEach(([b])=>dropBuffer(b))}
+out(1,`Allocation boundary encountered: ${limitHit}. This is a browser/device allocation observation, not a measurement of dedicated VRAM.`);
+out(1,`GPU errors: ${errs}, device lost: ${lost}`);
+return ok&&!lost&&best>0
+}
+// TEST 3
+async function t3(){const n=512,N=Math.max(30,Math.min(300,+$('its').value||30)),[A,B]=gen(n,Float32Array),bA=buf(A,U.STORAGE),bB=buf(B,U.STORAGE),bC=makeBuffer({size:n*n*4,usage:U.STORAGE}),p=mmP(n,'f32'),bg=bgOf(p,[bA,bB,bC]),e0=errs,ts=[];
+for(let i=0;i<3;i++)await run1(p,bg,n);
+for(let i=0;i<N;i++){checkStop();ts.push(await run1(p,bg,n));prog(2,(i+1)/N*100,`${i+1}/${N}`);await sleep()}
+const s=st(ts),a=ts.slice(0,10).reduce((x,y)=>x+y,0)/10,z=ts.slice(-10).reduce((x,y)=>x+y,0)/10;
+out(2,`Iterations ${N}: avg ${f(s.avg,1)} | median ${f(s.med,1)} | min ${f(s.min,1)} | max ${f(s.max,1)} ms`);out(2,`Variation (sd/avg): ${f(s.sd/s.avg*100,1)}% | first-10 avg ${f(a,1)} vs last-10 avg ${f(z,1)} ms (${f((z-a)/a*100,1)}% drift)`);
+out(2,'Times: '+ts.map(x=>f(x,1)).join(' '));out(2,`GPU errors: ${errs-e0}, device lost: ${lost}. Drift is not proof of thermal throttling.`);[bA,bB,bC].forEach(b=>b.destroy());return errs===e0&&!lost}
+// TEST 4
+function cpuMM(A,B,n){const C=new Float32Array(n*n);for(let i=0;i<n;i++)for(let k=0;k<n;k++){const a=A[i*n+k];for(let j=0;j<n;j++)C[i*n+j]=C[i*n+j]+Math.fround(a*B[k*n+j])}return C}
+async function t4(){let ok=true;cpuMM(...gen(64,Float32Array),64);
+for(const n of[256,512]){checkStop();prog(3,n===256?10:55,'CPU '+n);await sleep();const[A,B]=gen(n,Float32Array);
+let t0=performance.now();const Cc=cpuMM(A,B,n),tc=performance.now()-t0;
+prog(3,n===256?35:80,'GPU '+n);t0=performance.now();const bA=buf(A,U.STORAGE),bB=buf(B,U.STORAGE),bC=makeBuffer({size:n*n*4,usage:U.STORAGE|U.COPY_SRC});await dev.queue.onSubmittedWorkDone();const up=performance.now()-t0;
+const p=mmP(n,'f32'),bg=bgOf(p,[bA,bB,bC]);await run1(p,bg,n);const ts=[];for(let i=0;i<5;i++)ts.push(await run1(p,bg,n));const gc=st(ts).med;
+t0=performance.now();const G=new Float32Array(await rd(bC,n*n*4)),dn=performance.now()-t0;
+let e=0;for(let i=0;i<n*n;i++)e=Math.max(e,Math.abs(G[i]-Cc[i])/Math.max(1,Math.abs(Cc[i])));
+const t1=performance.now();const q=buf(A,U.STORAGE),w=buf(B,U.STORAGE),r=makeBuffer({size:n*n*4,usage:U.STORAGE|U.COPY_SRC}),p2=bgOf(p,[q,w,r]);await run1(p,p2,n);await rd(r,n*n*4);const tot=performance.now()-t1;
+out(3,`${n}x${n}: CPU(JS, 1 thread, exact f32) ${f(tc,1)} ms | GPU setup/input staging ${f(up,1)} | compute ${f(gc,1)} | readback ${f(dn,1)} | GPU end-to-end ${f(tot,1)} ms`);
+out(3,`   GPU compute is x${f(tc/gc,1)} vs CPU, end-to-end x${f(tc/tot,1)} | max rel diff ${e.toExponential(2)} ${e<1e-4?'PASS':'FAIL'}`);if(e>=1e-4)ok=false;[bA,bB,bC,q,w,r].forEach(b=>b.destroy());await sleep()}
+return ok}
+const TESTS=[t1,t2,t3,t4];
+async function runT(i){if(busy)return;busy=true;stop=false;document.querySelectorAll('button').forEach(b=>{if(b.id!=='stop'&&b.id!=='cp')b.disabled=true});
+T[i]=[];$('d'+i).textContent='';setS(i,'RUNNING');prog(i,0,'');
+const errStart=errs;
+try{await init();checkStop();const ok=await TESTS[i]();if(errs>errStart||lost){setS(i,'ERROR');out(i,'GPU errors/device loss occurred during this test.')}else{setS(i,ok?'PASS':'FAIL');prog(i,100,'')}}
+catch(e){if(e.message==='STOPPED'||stop){setS(i,'STOPPED');out(i,'Test cancelled by user.')}else{setS(i,'ERROR');out(i,'ERROR: '+e.message)}}
+finally{cleanup();busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)}}
+document.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>runT(+b.dataset.i));
+$('all').onclick=async()=>{for(let i=0;i<4;i++){await runT(i);if(stop)break}};
+$('stop').onclick=()=>{stop=true};
+$('cp').onclick=async()=>{const t=H.join('\n')+'\n\n'+NAMES.map((n,i)=>`## ${n}: ${$('s'+i).textContent}\n${(T[i]||['not run']).join('\n')}`).join('\n\n');
+try{await navigator.clipboard.writeText(t);alert('Report copied')}catch(e){alert('Copy failed, select the text manually')}};
+</script></main></body></html>
