@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SANVI GPU TEST 001</title>
+<style>
+:root{--bg:#F4F5FA;--card:#fff;--ink:#1A1D2E;--ok:#1E8E5A;--bad:#C0392B;--acc:#4B5BD6;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root{--bg:#10121C;--card:#1A1D2E;--ink:#ECEEFA;--ok:#4CD08A;--bad:#FF7A6B;--acc:#8793FF}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
+main{max-width:600px;margin:0 auto;padding:14px}h1{font-size:1.2rem;margin:0 0 4px}
+pre{background:var(--card);border-radius:14px;padding:12px;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,monospace}
+button{font:inherit;border:0;border-radius:12px;padding:10px 16px;background:var(--acc);color:#fff;font-weight:600;margin:4px 6px 4px 0}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+</style></head><body><main>
+<h1>SANVI GPU TEST 001</h1>
+<div>Compute shader execution and CPU readback.</div>
+<button id="go">Run test</button><button id="cp">Copy report</button>
+<pre id="o">Press Run test.</pre>
+</main><script>
+const o=document.getElementById('o');let R=[];
+const log=(s,c)=>{R.push(s);const d=document.createElement('div');d.textContent=s;if(c)d.className=c;if(R.length===1)o.textContent='';o.appendChild(d)};
+const S=()=>GPUBufferUsage;
+async function main(){
+R=[];o.textContent='';
+log('SANVI-HW-001 | '+new Date().toLocaleString());log('UA: '+navigator.userAgent);
+if(!navigator.gpu){log('FAIL: navigator.gpu missing. WebGPU unavailable here (needs HTTPS and a supported Chrome).','bad');return}
+const ad=await navigator.gpu.requestAdapter();
+if(!ad){log('FAIL: no WebGPU adapter.','bad');return}
+let inf=ad.info||(ad.requestAdapterInfo?await ad.requestAdapterInfo():{});
+log('Adapter: '+[inf.vendor,inf.architecture,inf.device,inf.description].filter(Boolean).join(' / '));
+const L=ad.limits;log('maxBufferSize: '+(L.maxBufferSize/1048576|0)+' MB | maxStorageBuffer: '+(L.maxStorageBufferBindingSize/1048576|0)+' MB | maxWorkgroupStorage: '+L.maxComputeWorkgroupStorageSize+' B');
+log('shader-f16: '+ad.features.has('shader-f16'));
+const dev=await ad.requestDevice();
+dev.lost.then(i=>log('DEVICE LOST: '+i.message,'bad'));
+dev.onuncapturederror=e=>log('GPU error: '+e.error.message,'bad');
+const U=GPUBufferUsage;
+const mk=(d,u)=>{const b=dev.createBuffer({size:d.byteLength,usage:u,mappedAtCreation:true});new Float32Array(b.getMappedRange()).set(d);b.unmap();return b};
+async function readback(src,bytes){const rb=dev.createBuffer({size:bytes,usage:U.MAP_READ|U.COPY_DST});const e=dev.createCommandEncoder();e.copyBufferToBuffer(src,0,rb,0,bytes);dev.queue.submit([e.finish()]);await rb.mapAsync(GPUMapMode.READ);const r=new Float32Array(rb.getMappedRange().slice(0));rb.unmap();rb.destroy();return r}
+function pipe(code){return dev.createComputePipeline({layout:'auto',compute:{module:dev.createShaderModule({code}),entryPoint:'main'}})}
+// TEST 1: vector add
+try{
+const N=1<<20,a=new Float32Array(N),b=new Float32Array(N);for(let i=0;i<N;i++){a[i]=i%1000;b[i]=(i%7)*0.5}
+const bA=mk(a,U.STORAGE),bB=mk(b,U.STORAGE),bC=dev.createBuffer({size:N*4,usage:U.STORAGE|U.COPY_SRC});
+const p=pipe(`@group(0)@binding(0) var<storage,read> a:array<f32>;@group(0)@binding(1) var<storage,read> b:array<f32>;@group(0)@binding(2) var<storage,read_write> c:array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g:vec3<u32>){let i=g.x;if(i<arrayLength(&c)){c[i]=a[i]+b[i];}}`);
+const bg=dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:[bA,bB,bC].map((x,i)=>({binding:i,resource:{buffer:x}}))});
+const e=dev.createCommandEncoder(),ps=e.beginComputePass();ps.setPipeline(p);ps.setBindGroup(0,bg);ps.dispatchWorkgroups(Math.ceil(N/64));ps.end();dev.queue.submit([e.finish()]);
+const r=await readback(bC,N*4);let bad=0;for(let i=0;i<N;i++)if(r[i]!==Math.fround(a[i]+b[i]))bad++;
+log('TEST 1 vector add, '+N+' elements: '+(bad?'FAIL ('+bad+' mismatches)':'PASS, GPU result matches CPU'),bad?'bad':'ok');
+}catch(err){log('TEST 1 ERROR: '+err.message,'bad')}
+// TEST 2: matmul benchmark
+for(const n of [256,512]){try{
+const A=new Float32Array(n*n),B=new Float32Array(n*n);for(let i=0;i<n*n;i++){A[i]=(i%13)/13;B[i]=(i%11)/11}
+const bA=mk(A,U.STORAGE),bB=mk(B,U.STORAGE),bC=dev.createBuffer({size:n*n*4,usage:U.STORAGE|U.COPY_SRC});
+const p=pipe(`const N:u32=${n}u;@group(0)@binding(0) var<storage,read> A:array<f32>;@group(0)@binding(1) var<storage,read> B:array<f32>;@group(0)@binding(2) var<storage,read_write> C:array<f32>;
+@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) g:vec3<u32>){let r=g.y;let c=g.x;if(r>=N||c>=N){return;}var s=0.0;for(var k=0u;k<N;k++){s+=A[r*N+k]*B[k*N+c];}C[r*N+c]=s;}`);
+const bg=dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:[bA,bB,bC].map((x,i)=>({binding:i,resource:{buffer:x}}))});
+const go=async()=>{const e=dev.createCommandEncoder(),ps=e.beginComputePass();ps.setPipeline(p);ps.setBindGroup(0,bg);ps.dispatchWorkgroups(n/8,n/8);ps.end();dev.queue.submit([e.finish()]);await dev.queue.onSubmittedWorkDone()};
+await go();let t=0;for(let i=0;i<3;i++){const t0=performance.now();await go();t+=performance.now()-t0}t/=3;
+const C=await readback(bC,n*n*4);let bad=0;
+for(const [r,c] of [[0,0],[1,2],[n-1,n-1],[n>>1,3],[7,n-2]]){let s=0;for(let k=0;k<n;k++)s+=A[r*n+k]*B[k*n+c];if(Math.abs(C[r*n+c]-s)>1e-3*Math.max(1,Math.abs(s)))bad++}
+const gf=2*n**3/(t/1000)/1e9;
+log('TEST 2 matmul '+n+'x'+n+': '+(bad?'FAIL':'PASS')+' | '+t.toFixed(1)+' ms | ~'+gf.toFixed(1)+' GFLOPS',bad?'bad':'ok');
+}catch(err){log('TEST 2 ('+n+') ERROR: '+err.message,'bad')}}
+log('Done. Paste this report into the chat.');
+}
+document.getElementById('go').onclick=()=>main().catch(e=>log('ERROR: '+e.message,'bad'));
+document.getElementById('cp').onclick=async()=>{try{await navigator.clipboard.writeText(R.join('\n'));alert('Report copied')}catch(e){alert('Could not copy. Select the text above manually.')}};
+</script></body></html>
