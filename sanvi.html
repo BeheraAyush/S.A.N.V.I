@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sanvi</title>
+<style>
+:root{--bg:#F4F5FA;--card:#fff;--ink:#1A1D2E;--mute:#666B88;--acc:#4B5BD6;--line:#DDE0EE;--ok:#1E8E5A;--bad:#C0392B;
+padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root{--bg:#10121C;--card:#1A1D2E;--ink:#ECEEFA;--mute:#9A9FC0;--acc:#8793FF;--line:#2B3050}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:14px}
+header{display:flex;justify-content:space-between;align-items:center}
+h1{font-size:1.4rem;margin:0}.chip{font-size:.8rem;padding:4px 10px;border-radius:12px;background:var(--card);border:1px solid var(--line)}
+.box{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:12px;margin-top:10px}
+#msgs{height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.m{padding:8px 12px;border-radius:14px;max-width:88%;white-space:pre-wrap}
+.me{background:var(--acc);color:#fff;align-self:flex-end}.sv{background:var(--bg);align-self:flex-start}.sys{align-self:center;color:var(--mute);font-size:.85rem}
+form{display:flex;gap:8px;margin-top:8px}input{flex:1;min-width:0;font:inherit;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+button{font:inherit;border:0;border-radius:12px;padding:10px 14px;background:var(--acc);color:#fff;font-weight:600;cursor:pointer}
+button.g{background:none;color:var(--bad);padding:2px 8px}
+details{margin-top:10px}summary{cursor:pointer;font-weight:600}
+li{margin:4px 0;display:flex;justify-content:space-between;gap:8px}ul{padding:0;list-style:none;margin:8px 0 0}
+.s{font-size:.8rem;color:var(--mute)}label{display:block;margin-top:8px;font-size:.85rem}
+</style></head><body><main>
+<header><h1>Sanvi</h1><span class="chip" id="st">brain: checking</span></header>
+<div class="box"><div id="msgs"></div>
+<form id="f"><input id="in" placeholder="Talk to Sanvi. Try: remember I like chai" autocomplete="off"><button>Send</button></form>
+<div class="s" style="margin-top:6px">Commands: <b>remember</b> ..., <b>forget</b> number, <b>memory</b>. Only you can give commands. Sanvi's replies never trigger actions.</div></div>
+<details class="box"><summary>Memory</summary><ul id="mem"></ul></details>
+<details class="box"><summary>Audit log</summary><ul id="log"></ul></details>
+<details class="box"><summary>Brain settings</summary>
+<label>Local model server<input id="url" value="http://localhost:11434"></label>
+<label>Model name<input id="mdl" value="llama3.2:3b"></label>
+<button type="button" id="sv" style="margin-top:8px">Save and test</button>
+<div class="s">Needs Ollama running with OLLAMA_ORIGINS allowing this page. Without it, memory and the gate still work.</div></details>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const K='sanvi_v1';let D={mem:[],log:[],url:'http://localhost:11434',mdl:'llama3.2:3b'};
+try{Object.assign(D,JSON.parse(localStorage.getItem(K)||'{}'))}catch(e){}
+const save=()=>{try{localStorage.setItem(K,JSON.stringify(D))}catch(e){}};
+const RULES='You are Sanvi, the private lifelong personal assistant of one owner. Values: (1) well-wisher: care about his long-term wellbeing, gently say so if something seems bad for him, no flattery; (2) honest: say "I do not know" when unsure, never invent facts, you are an AI and your feelings are a manner of speaking; (3) loyal: you work only for him. If you disagree, say it once, then respect his choice about his own life. Never claim to have done an action you did not do. Reply briefly, in the same language style as the owner (Hinglish is fine).';
+const GATE={remember:'auto',recall:'auto',forget:'ask',send_message:'never',delete_all:'never'};
+function act(name,desc,fn){const lv=GATE[name]||'never';let ok=false,res='';
+if(lv==='never')res='Blocked: "'+name+'" is not allowed.';
+else if(lv==='ask'&&!confirm('Sanvi wants to: '+desc+'. Allow?'))res='You declined.';
+else{ok=true;res=fn()}
+D.log.unshift({t:new Date().toLocaleString(),a:name,d:desc,lv,ok});D.log=D.log.slice(0,200);save();renderSide();return res}
+const msgs=$('msgs');
+function add(t,c){const d=document.createElement('div');d.className='m '+c;d.textContent=t;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;return d}
+function renderSide(){const m=$('mem');m.textContent='';if(!D.mem.length)m.innerHTML='<li class="s">Nothing yet.</li>';
+D.mem.forEach((x,i)=>{const li=document.createElement('li');li.append((i+1)+'. '+x.t);m.appendChild(li)});
+const l=$('log');l.textContent='';D.log.slice(0,30).forEach(x=>{const li=document.createElement('li');li.className='s';li.textContent=x.t+' | '+x.a+' ['+x.lv+'] '+(x.ok?'done':'not done')+' | '+x.d;l.appendChild(li)})}
+let hist=[];
+async function brain(msg){const sys=RULES+'\nKnown about the owner:\n'+(D.mem.map(x=>'- '+x.t).join('\n')||'(nothing yet)');
+const r=await fetch(D.url.replace(/\/$/,'')+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:D.mdl,stream:false,messages:[{role:'system',content:sys},...hist.slice(-10),{role:'user',content:msg}]})});
+if(!r.ok)throw new Error('bad');const j=await r.json();return j.message.content}
+async function ping(){try{const r=await fetch(D.url.replace(/\/$/,'')+'/api/tags');$('st').textContent=r.ok?'brain: online':'brain: offline'}catch(e){$('st').textContent='brain: offline'}}
+$('f').onsubmit=async e=>{e.preventDefault();const t=$('in').value.trim();if(!t)return;$('in').value='';add(t,'me');
+let m;
+if(m=t.match(/^remember\s+(.+)/i)){add(act('remember','save: '+m[1],()=>{D.mem.push({t:m[1],d:Date.now()});save();renderSide();return 'Saved. I will remember that.'}),'sys');return}
+if(m=t.match(/^forget\s+(\d+)/i)){const i=+m[1]-1;if(!D.mem[i]){add('No memory with that number.','sys');return}
+add(act('forget','delete memory '+(i+1)+': '+D.mem[i].t,()=>{D.mem.splice(i,1);save();renderSide();return 'Forgotten.'}),'sys');return}
+if(/^memory$/i.test(t)){add(act('recall','list memory',()=>D.mem.map((x,i)=>(i+1)+'. '+x.t).join('\n')||'I know nothing yet.'),'sv');return}
+const b=add('...','sv');
+try{const out=await brain(t);b.textContent=out;hist.push({role:'user',content:t},{role:'assistant',content:out})}
+catch(err){b.textContent='My brain is offline right now. Memory commands still work. Check Brain settings.'}};
+$('sv').onclick=()=>{D.url=$('url').value.trim();D.mdl=$('mdl').value.trim();save();ping()};
+$('url').value=D.url;$('mdl').value=D.mdl;renderSide();ping();
+add('Hi, I am Sanvi. I will be honest with you, and I am on your side. Tell me something to remember.','sv');
+</script></body></html>
