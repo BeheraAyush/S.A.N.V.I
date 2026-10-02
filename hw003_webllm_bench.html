@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SANVI HW-003 WebLLM bench</title>
+<style>
+:root{--bg:#F4F5FA;--card:#fff;--ink:#1A1D2E;--mute:#666B88;--acc:#4B5BD6;--line:#DDE0EE;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root{--bg:#10121C;--card:#1A1D2E;--ink:#ECEEFA;--mute:#9A9FC0;--acc:#8793FF;--line:#2B3050}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:14px}
+h1{font-size:1.2rem;margin:0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:10px}
+select,button{font:inherit;border-radius:10px}select{width:100%;padding:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+button{border:0;padding:8px 14px;background:var(--acc);color:#fff;font-weight:600;margin:6px 6px 0 0}button:disabled{opacity:.5}
+pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,monospace;margin:6px 0 0}.s{color:var(--mute);font-size:.82rem}
+</style></head><body><main>
+<h1>SANVI HW-003: WebLLM benchmark</h1>
+<div class="s">Real model inference. Needs internet for the first download (about 1 GB for a 1B model). Keep the page open and the tablet charging.</div>
+<div class="card"><select id="sel"><option>Loading model list...</option></select>
+<button id="load" disabled>1. Load model</button><button id="run" disabled>2. Run benchmark</button><button id="stop" disabled>Stop</button><button id="unl" disabled>Unload</button><button id="cp">Copy report</button>
+<div class="s" id="prog" style="margin-top:6px"></div></div>
+<div class="card"><pre id="out"></pre></div>
+<script type="module">
+const $=id=>document.getElementById(id);let W,engine,list=[],rep=[],busy=false;
+const log=t=>{rep.push(t);$('out').textContent=rep.join('\n')};
+const lock=b=>{busy=b;['load','run','unl'].forEach(i=>$(i).disabled=b||(i!=='load'&&!engine));$('stop').disabled=!b||!engine};
+const med=a=>{const s=[...a].filter(x=>isFinite(x)).sort((x,y)=>x-y);return s.length?(s.length%2?s[s.length>>1]:(s[s.length/2-1]+s[s.length/2])/2):NaN};
+const f=(x,d=2)=>isFinite(x)?x.toFixed(d):'n/a';
+const P1='Explain in two sentences what a mitochondrion does in a cell.';
+const P2='Summarize the following text in one sentence. '+'The cell is the basic unit of life. Cells contain organelles that carry out specific jobs, such as making energy, building proteins and storing genetic information. '.repeat(14);
+window.addEventListener('unhandledrejection',e=>log('UNHANDLED: '+(e.reason&&e.reason.message||e.reason)));
+(async()=>{
+log('SANVI HW-003 | '+new Date().toLocaleString());log('UA: '+navigator.userAgent);
+if(!navigator.gpu){log('ERROR: WebGPU unavailable');return}
+const ad=await navigator.gpu.requestAdapter();if(!ad){log('ERROR: no adapter');return}
+const f16=ad.features.has('shader-f16');log('Adapter limits: maxStorageBinding '+(ad.limits.maxStorageBufferBindingSize/1048576|0)+' MB, maxBuffer '+(ad.limits.maxBufferSize/1048576|0)+' MB, shader-f16 '+f16);
+try{W=await import('https://esm.run/@mlc-ai/web-llm')}catch(e){log('ERROR: could not load WebLLM from CDN: '+e.message);return}
+log('WebLLM loaded unpinned from esm.run. Record today\'s date as the version reference.');
+list=W.prebuiltAppConfig.model_list.filter(m=>(m.model_type===undefined||m.model_type===0)&&m.vram_required_MB&&m.vram_required_MB<=2600&&(f16||!(m.required_features||[]).includes('shader-f16'))).sort((a,b)=>a.vram_required_MB-b.vram_required_MB);
+$('sel').innerHTML=list.map((m,i)=>`<option value="${i}">${m.model_id} | ~${Math.round(m.vram_required_MB)} MB est.${m.low_resource_required?' | low-res':''}</option>`).join('');
+lock(false);})();
+$('load').onclick=async()=>{const m=list[+$('sel').value];lock(true);
+try{if(engine){await engine.unload();engine=null}
+log('\nLOADING '+m.model_id+' (est. '+Math.round(m.vram_required_MB)+' MB, required_features '+JSON.stringify(m.required_features||[])+')');
+const t0=performance.now();engine=await W.CreateMLCEngine(m.model_id,{initProgressCallback:r=>{$('prog').textContent=r.text}});
+log('Load time: '+f((performance.now()-t0)/1000,1)+' s (includes download if not cached; load again for a cached time)')}
+catch(e){engine=null;log('LOAD ERROR: '+e.message)}$('prog').textContent='';lock(false)};
+$('run').onclick=async()=>{lock(true);const m=list[+$('sel').value];log('\nBENCHMARK '+m.model_id+' | max_tokens 64, temperature 0');
+try{for(const[name,p]of[['short',P1],['long',P2]]){const ft=[],dt=[],pf=[],dc=[];
+for(let r=1;r<=3;r++){const t0=performance.now();let tf=null,n=0,u=null;
+const s=await engine.chat.completions.create({messages:[{role:'user',content:p}],stream:true,stream_options:{include_usage:true},max_tokens:64,temperature:0});
+for await(const c of s){if(c.choices[0]&&c.choices[0].delta&&c.choices[0].delta.content){if(tf===null)tf=performance.now();n++}if(c.usage)u=c.usage}
+const t1=performance.now(),x=u&&u.extra||{},fl=tf?(tf-t0)/1000:NaN,d=n>1?(n-1)/((t1-tf)/1000):NaN;
+ft.push(fl);dt.push(d);pf.push(x.prefill_tokens_per_s);dc.push(x.decode_tokens_per_s);
+log(`${name} run ${r}: first token ${f(fl)} s | decode ~${f(d,1)} tok/s (chunk count) | WebLLM prefill ${f(x.prefill_tokens_per_s,1)} / decode ${f(x.decode_tokens_per_s,1)} tok/s | tokens in ${u?u.prompt_tokens:'n/a'}, out ${u?u.completion_tokens:'n/a'}`)}
+log(`${name} MEDIANS: first token ${f(med(ft))} s | decode ${f(med(dt),1)} tok/s (mine) / ${f(med(dc),1)} (WebLLM) | prefill ${f(med(pf),1)} tok/s (WebLLM)`)}
+try{log('runtimeStats: '+await engine.runtimeStatsText())}catch(e){}
+log('Done. Run 1 of each prompt may include shader warm-up. Note any tab reload, freeze or heat.')}
+catch(e){log('RUN ERROR: '+e.message)}lock(false)};
+$('stop').onclick=()=>{try{engine.interruptGenerate()}catch(e){}};
+$('unl').onclick=async()=>{lock(true);try{await engine.unload();engine=null;log('Model unloaded.')}catch(e){log('UNLOAD ERROR: '+e.message)}lock(false)};
+$('cp').onclick=async()=>{try{await navigator.clipboard.writeText(rep.join('\n'));alert('Report copied')}catch(e){alert('Copy failed, select the text manually')}};
+</script></main></body></html>
