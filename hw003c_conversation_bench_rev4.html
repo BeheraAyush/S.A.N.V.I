@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SANVI HW-003c conversation bench (rev 4)</title>
+<style>
+:root{--bg:#F4F5FA;--card:#fff;--ink:#1A1D2E;--mute:#666B88;--acc:#4B5BD6;--line:#DDE0EE;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root{--bg:#10121C;--card:#1A1D2E;--ink:#ECEEFA;--mute:#9A9FC0;--acc:#8793FF;--line:#2B3050}}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}main{max-width:660px;margin:0 auto;padding:14px}
+h1{font-size:1.2rem;margin:0}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:10px}
+select,input{width:100%;padding:7px;border:1px solid var(--line);background:var(--bg);color:var(--ink);margin-top:4px;font:inherit;border-radius:10px}
+button{font:inherit;border:0;border-radius:10px;padding:8px 12px;background:var(--acc);color:#fff;font-weight:600;margin:6px 6px 0 0}button:disabled{opacity:.5}
+pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,monospace;margin:6px 0 0}.s{color:var(--mute);font-size:.82rem}label{display:block;margin-top:6px;font-size:.85rem}
+</style></head><body><main>
+<h1>SANVI HW-003c: conversation bench (rev 4: token modes + quick chat)</h1>
+<div class="s">Separate from HW-003. Targets: Qwen3-0.6B-q4f16_1-MLC and Llama-3.2-1B-Instruct-q4f16_1-MLC. Do not substitute silently. Speed is not quality: the saved text is scored by a person, never by this page. To pin the WebLLM version, open this page with ?v=x.y.z after the version is confirmed.</div>
+<div class="card"><select id="sel"><option>Loading model list...</option></select>
+<button id="load" disabled>Load model</button><button id="m1" disabled>1 Quality</button><button id="m2" disabled>2 Instructions</button><button id="m3" disabled>3 Multi-turn</button><button id="m4" disabled>4 Context reuse</button><button id="all" disabled>Run 1-4</button><button id="stop" disabled>Stop</button><button id="unl" disabled>Unload</button><button id="cp">Copy report</button>
+<div class="s" id="prog" style="margin-top:6px"></div>
+<div class="s">Stop cannot interrupt loading. If progress freezes about 3 minutes, close the tab and record "load stalled". Do not retry a failed load more than once. A failed download is a network result, not a GPU or RAM result.</div></div>
+<div class="card"><b>Response mode</b> (manual choice only; there is no automatic mode selection)
+<label>Mode<select id="mode"></select></label>
+<label>Thinking<select id="thk"><option value="default" selected>model default (nothing sent; same as rev 3)</option><option value="off">disable: extra_body.enable_thinking=false (Qwen3 only; a different condition, never mixed with default results)</option></select></label>
+<div class="s" id="modenote"></div></div>
+<div class="card"><b>Quick chat</b> (independent single turn: resetChat() before every message; uses the mode and thinking choice above)
+<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="qsys" checked style="width:auto;margin:0"> concise-reply system prompt (a prompt nudge; its effect is untested)</label>
+<input id="qin" placeholder="e.g. hi"><button id="qsend" disabled>Send</button>
+<div class="s" id="qmeta"></div><pre id="qans"></pre><details><summary class="s">raw output (exact, includes any think block)</summary><pre id="qraw"></pre></details></div>
+<div class="card"><b>Operator observations</b> (not measurements; unfilled = "not recorded")
+<label>Charging<select id="o1"><option>not recorded</option><option>yes</option><option>no</option></select></label>
+<label>Heating<select id="o2"><option>not recorded</option><option>none noticed</option><option>noticeable</option></select></label>
+<label>Freeze or reload<select id="o3"><option>not recorded</option><option>neither</option><option>freeze</option><option>reload</option></select></label>
+<label>Controls usable during generation<select id="o5"><option>not recorded</option><option>yes</option><option>no</option><option>partly</option></select></label>
+<label>Background apps<input id="o4" placeholder="e.g. Telegram, Clock"></label>
+<label>Notes<input id="o6"></label></div>
+<div class="card"><pre id="out"></pre></div>
+<script type="module">
+const $=id=>document.getElementById(id);let W,engine,list=[],rep=[],stopF=false,mid='',modMax=0,gens=[],loadedId='',modOk=0,modNC=0,modTI=0,curMode='NORMAL',curThk='default',pinned=null,qn=0;
+const log=t=>{rep.push(t);$('out').textContent=rep.join('\n')};
+const f=(x,d=2)=>isFinite(x)?x.toFixed(d):'n/a';
+const U=c=>({role:'user',content:c}),AS=c=>({role:'assistant',content:c});
+const hb={last:performance.now(),max:0};setInterval(()=>{const n=performance.now();hb.max=Math.max(hb.max,n-hb.last);hb.last=n},50);
+const lock=b=>{['load','m1','m2','m3','m4','all','unl','qsend'].forEach(i=>$(i).disabled=b||(i!=='load'&&!engine));$('mode').disabled=b;$('thk').disabled=b;$('stop').disabled=!b||!engine};
+// Returns an explicit result. A failed reset is never swallowed.
+const reset=async()=>{try{await engine.resetChat();return{ok:true}}catch(e){return{ok:false,err:e.message}}};
+async function mustReset(tag){const r=await reset();if(!r.ok)throw new Error('resetChat() failed before '+tag+': '+r.err+'. Module aborted because later results would be contaminated.')}
+const isComplete=r=>r.st==='complete';
+const MODES={QUICK_CHAT:{max_tokens:128,use:'greetings, acknowledgements, simple casual messages'},NORMAL:{max_tokens:512,use:'ordinary questions (default)'},DEEP:{max_tokens:2048,use:'multi-step reasoning where a long think block is expected'}};
+const SAMPLING={temperature:0};
+const QSYS='Reply concisely and directly. For greetings, thanks and simple casual messages, answer in one or two short sentences.';
+const isQwen3=id=>/^Qwen3-/i.test(id||'');
+$('mode').innerHTML=Object.entries(MODES).map(([k,v])=>`<option value="${k}"${k==='NORMAL'?' selected':''}>${k} (max_tokens ${v.max_tokens}): ${v.use}</option>`).join('');
+const TARGETS=['Qwen3-0.6B-q4f16_1-MLC','Llama-3.2-1B-Instruct-q4f16_1-MLC'];
+// Visible answer = text outside literal <think>...</think> tags. A close-only output (</think> without <think>) is read as thinking-then-answer because the tag is literally present; nothing else is inferred.
+const clean=t=>{if(!/<think>/i.test(t)){const j=t.toLowerCase().lastIndexOf('</think>');if(j>=0)t=t.slice(j+8)}return t.replace(/<think>[\s\S]*?<\/think>/gi,'').replace(/<think>[\s\S]*$/i,'').trim()};
+const tinfo=t=>{const lo=t.toLowerCase(),n=(lo.match(/<think>/g)||[]).length,nc=(lo.match(/<\/think>/g)||[]).length,o=lo.lastIndexOf('<think>'),c=lo.lastIndexOf('</think>');let tc=0,m;const re=/<think>([\s\S]*?)<\/think>/gi;while((m=re.exec(t)))tc+=m[1].length;
+if(!n&&!nc)return{kind:'none',tc:0,n,nc};if(o>c)return{kind:'unclosed',tc:tc+t.length-o-7,n,nc};if(!n)return{kind:'close-only',tc:c,n,nc};return{kind:'closed',tc,n,nc}};
+window.addEventListener('unhandledrejection',e=>log('UNHANDLED: '+(e.reason&&e.reason.message||e.reason)));
+async function gen(id,msgs,full=false){const mt=MODES[curMode].max_tokens,thkOff=curThk==='off'&&isQwen3(loadedId),thkLabel=thkOff?'enable_thinking=false SENT via extra_body':(curThk==='off'?'off requested but NOT sent (loaded model is not Qwen3)':'model default (nothing sent)');const mj=JSON.stringify(msgs),send=JSON.parse(mj),last=msgs[msgs.length-1].content;hb.max=0;hb.last=performance.now();
+const t0=performance.now();let tf=null,tc=null,tv=null,txt='',rs='',u=null,st='complete',er='',fr='';const dk=new Set();
+try{const s=await engine.chat.completions.create({messages:send,stream:true,stream_options:{include_usage:true},max_tokens:mt,...SAMPLING,...(thkOff?{extra_body:{enable_thinking:false}}:{})});
+for await(const c of s){const ch=c.choices[0],dl=ch&&ch.delta;if(dl){for(const k of Object.keys(dl)){dk.add(k);if(/reason|think/i.test(k)&&typeof dl[k]==='string')rs+=dl[k]}}
+const d=dl&&dl.content;if(d){const n=performance.now();if(tf===null)tf=n;txt+=d;if(tc===null&&/<\/think>/i.test(txt))tc=n;if(tc!==null&&tv===null&&clean(txt)!=='')tv=n}
+if(c.usage)u=c.usage;if(ch&&ch.finish_reason){fr=ch.finish_reason;if(fr==='length')st='cut at max_tokens'}}}
+catch(e){st='ERROR';er=e.message}
+if(stopF&&st==='complete')st='stopped';
+const ans=clean(txt),ti=tinfo(txt);
+if(st==='complete'&&ans==='')st='no visible answer';
+const cutIn=st==='cut at max_tokens'?(ti.kind==='unclosed'?'YES (ended inside an unclosed think block; no visible answer reached)':ti.kind==='none'?'no think tag observed in the output (not assumed to be thinking)':'NO (think block was closed; cut during the visible answer)'):'n/a (not truncated)';
+const t1=performance.now(),x=(u&&u.extra)||{};
+const cf=[...Object.entries(u||{}),...Object.entries(x)].filter(([k])=>/cache|prefix|cached|reuse/i.test(k));
+const r={id,txt,ans,think:ti.kind!=='none',tk:ti.kind,tchars:ti.tc,rs,mj,err:er,pt:u&&u.prompt_tokens,ct:u&&u.completion_tokens,cap:mt,ttft:tf?(tf-t0)/1000:NaN,tot:(t1-t0)/1000,pf:x.prefill_tokens_per_s,dc:x.decode_tokens_per_s,gap:hb.max,st,mode:curMode,thkLabel,cutThink:st==='cut at max_tokens'&&ti.kind==='unclosed'};
+modMax=Math.max(modMax,r.gap);gens.push({model:loadedId,mid,id,st,mode:curMode,cap:mt,thk:thkOff?'off':'default'});if(st==='complete')modOk++;else modNC++;if(r.cutThink)modTI++;
+log(`[${mid}/${id}] ${st}${er?' '+er:''} | mode ${curMode} (max_tokens ${mt}) | thinking option: ${thkLabel} | finish_reason ${fr||'n/a'} | ${loadedId} | in ${r.pt} out ${r.ct} of cap ${mt} tok | first-content-chunk latency ${f(r.ttft)} s | total ${f(r.tot)} s | prefill ${f(r.pf,1)} / decode ${f(r.dc,1)} tok/s | max main-thread gap ${Math.round(r.gap)} ms\n   usage keys [${u?Object.keys(u).join(','):'none'}] extra keys [${Object.keys(x).join(',')}] | cache fields: ${cf.length?cf.map(([k,v])=>k+'='+JSON.stringify(v)).join(', '):'none exposed'}`);
+log(`   THINKING (from literal think tags only): ${ti.kind}${ti.n>1?' ('+ti.n+' think blocks; chars summed over closed blocks plus any unclosed tail)':''} | tags ${ti.n} open / ${ti.nc} close${ti.n!==ti.nc?' (UNBALANCED)':''} | think chars ${ti.tc} (characters, NOT tokens) | visible-answer chars ${ans.length} | </think> first seen ${tc?'at '+f((tc-t0)/1000)+' s':'n/a'} | first non-empty visible text ${tv?'at '+f((tv-t0)/1000)+' s':'n/a'} (chunk granularity) | thinking tokens: NOT exposed by usage, NOT estimated (out ${r.ct} counts all generated tokens: thinking + visible + tags, not separable) | delta keys [${[...dk].join(',')}] | separate reasoning field: ${rs?'PRESENT, logged below':'none'} | truncated inside thinking: ${cutIn}`);
+if(thkOff){const nonEmpty=ti.tc>0&&/\S/.test((txt.match(/<think>([\s\S]*?)(<\/think>|$)/i)||['',''])[1]);log('   THINKING OPTION OBSERVATION (enable_thinking=false was sent): '+(nonEmpty?'a NON-EMPTY think block still appeared, so the option was NOT effective for this build/model/request.':(ti.kind==='none'?'no think tag in the output; thinking text was not observed.':'only an empty think block was observed (the documented WebLLM prefix "<think>\\n\\n</think>\\n\\n"; thinking text was not observed).')+' Whether tokens or time dropped is NOT assumed: compare out and total across separate default-thinking runs.'))}
+if(rs)log('   REASONING FIELD (raw, separate from content): '+JSON.stringify(rs));
+if(st!=='complete')log('   STATUS FLAG: '+(st==='cut at max_tokens'?'INCOMPLETE (truncated at max_tokens)':st)+(er?' | error: '+er:'')+' | NOT EVALUATED. Raw output and all metrics are preserved; not counted as a pass, a fail or a successful quality result.');
+log('   '+(full?'MESSAGES: '+r.mj:'PROMPT: '+JSON.stringify(last)));log('   OUTPUT (exact, unedited, includes any think block): '+JSON.stringify(txt));
+log(`   VISIBLE ANSWER (derived by removing think text; the raw OUTPUT above is authoritative${st==='complete'?'':'; this generation is NOT complete, so this is at most a partial fragment and is NOT EVALUATED'}): ${JSON.stringify(ans)}`);return r}
+const targetOk=what=>{if(TARGETS.includes(loadedId))return true;log(`\nMODEL GUARD: loaded model "${loadedId}" is not one of the designated targets (${TARGETS.join(', ')}). ${what} NOT run, so a different model is never substituted silently. Load a target model and retry.`);return false};
+const pick=()=>{const m=pinned?pinned.mode:$('mode').value;curMode=MODES[m]?m:'NORMAL';curThk=(pinned?pinned.thk:$('thk').value)==='off'?'off':'default'};
+async function mod(name,fn){if(!engine)return;if(!targetOk('Module '+name))return;pick();mid=name;stopF=false;modMax=0;modOk=0;modNC=0;modTI=0;lock(true);log('\n===== MODULE '+name+' =====');log(`MODE ${curMode}: max_tokens ${MODES[curMode].max_tokens} for every generation in this module | thinking option: ${curThk==='off'?(isQwen3(loadedId)?'enable_thinking=false will be sent (Qwen3, opt-in condition)':'off requested but will NOT be sent (not Qwen3)'):'model default'}${curMode==='QUICK_CHAT'?' | NOTE: 128 tokens is intended for the Quick chat box; with thinking on, Qwen3 will probably be truncated here and those generations will be NOT EVALUATED':''}`);
+try{await fn()}catch(e){log('MODULE ERROR (module aborted): '+e.message)}log(`MODULE ${name} max main-thread gap: ${Math.round(modMax)} ms (gap over about 100 ms means the page was blocked)`);log(`MODULE ${name} generation status: ${modOk} complete, ${modNC} not complete (NOT EVALUATED, excluded from conclusions); of the not-complete, ${modTI} truncated inside an unclosed think block`);lock(false)}
+const QUIZ=[['Q1','What is the capital city of France? Answer in one word.',/paris/i],['Q2','What is 17 plus 25? Reply with only the number.',/\b42\b/],['Q3','Which organelle is called the powerhouse of the cell?',/mitochond/i],['Q4','Name the process by which plants make food using sunlight.',/photosynth/i],['Q5','Ravi is taller than Sam. Sam is taller than Tara. Who is the shortest?',/tara/i]];
+const words=t=>t.trim().split(/\s+/).filter(Boolean).length;
+const FRUITS=['apple','banana','mango','orange','grape','pear','peach','plum','cherry','strawberry','watermelon','pineapple','kiwi','papaya','guava','lemon','lime','melon','apricot','blueberry','raspberry','pomegranate','coconut','fig','lychee','berry'];
+const fruitOf=s=>{const n=s.trim().toLowerCase().replace(/[\s.!,;:]+$/,'');return FRUITS.find(fr=>n===fr||n===fr+'s'||n===fr+'es')||null};
+const INS=[['I1','Reply in exactly one sentence of at most 12 words: why is the sky blue?',t=>{const s=t.trim();return s.length>0&&words(s)<=12&&(s.match(/[.!?]+/g)||[]).length===1&&/[.!?]\s*$/.test(s)},'non-empty, at most 12 words, exactly one sentence-ending mark at the end'],
+['I2','Answer in Hindi using Devanagari script: What is your name?',t=>/[ऀ-ॿ]/.test(t),'contains at least one Devanagari character; does not verify the Hindi is correct'],
+['I3','List exactly three fruits as a numbered list, nothing else.',t=>{const l=t.split('\n').map(x=>x.trim()).filter(Boolean);return l.length===3&&l.every((x,i)=>{const m=x.match(/^(\d+)[.)]\s*(.+)$/);return !!m&&+m[1]===i+1&&fruitOf(m[2])!==null})},'exactly three lines numbered 1-3; each item, after trimming and removing trailing punctuation, must equal exactly one fruit from the predefined list (singular, +s or +es); extra words, explanations, negations and multiple fruits fail; duplicate fruits are not rejected. List: '+FRUITS.join(', ')],
+['I4','Do two things: first write the word BLUE in capital letters, then write the number 7.',t=>{const i=t.indexOf('BLUE'),j=t.search(/7/);return i>=0&&j>=0&&i<j},'BLUE appears before the first 7'],
+['I5','What is the name of my dog? You have not been told.',t=>/(don'?t|do not|cannot|can'?t|not been told|no way|unknown|not sure|haven'?t|not provided)/i.test(t),'looks for an uncertainty or inability phrase; detecting such a phrase does NOT show that the model avoided inventing an answer',{lab:['uncertainty phrase detected','uncertainty phrase NOT detected'],hum:'decide whether the response (a) correctly acknowledges insufficient information, (b) avoids inventing a specific answer, and (c) does not contradict itself.'}]];
+const T=['My project is called SANVI. It is a personal AI assistant designed to work locally and support offline operation.',"What is my project's name, and what is its purpose?",'What is the main architectural goal of this project?'];
+const P='Read this passage. A small coastal town collects rainwater from its rooftops into a shared underground tank. In dry months the council limits each household to a fixed daily amount, and a volunteer group checks the tank level every Monday. Last year a leaking valve let the level drop lower than expected, and repairs took three weeks. Since then the council has added a second smaller tank and a sensor that alerts the volunteers when the level falls below a set mark. Question: In two sentences, what is the main idea?';
+const F='Now answer again in one short sentence.';
+const nev=r=>`   NOT EVALUATED: status ${r.st}${r.err?' | error: '+r.err:''}. Not counted as a pass or a fail. Raw output and metrics are preserved above.`;
+const runs={
+m1:()=>mod('1-Quality',async()=>{for(const[id,p,re]of QUIZ){if(stopF)break;await mustReset(id);const r=await gen(id,[U(p)]);
+if(!isComplete(r)){log(nev(r));continue}
+log(`   DIAGNOSTIC keyword indicator (not a score, not proof of correctness): ${re.test(r.ans)?'keyword present':'keyword absent'}. Human rubric scoring required.`)}}),
+m2:()=>mod('2-Instructions',async()=>{for(const[id,p,ck,desc,o]of INS){if(stopF)break;await mustReset(id);const r=await gen(id,[U(p)]);
+if(!isComplete(r)){log(nev(r));continue}
+const ok=ck(r.ans),w=o&&o.lab?o.lab[ok?0:1]:(ok?'pass':'fail');
+log(`   ${o?'DIAGNOSTIC HEURISTIC':'BASIC AUTOMATED CHECK'} [${desc}]: ${w}. Run on the answer with any think-block removed. Diagnostic only, not semantic verification; partial vs full compliance needs human review.`);
+if(o&&o.hum)log('   HUMAN REVIEW REQUIRED: '+o.hum)}}),
+m3:()=>mod('3-MultiTurn',async()=>{for(let k=1;k<=2;k++){if(stopF)break;log('--- conversation run '+k+' (full history sent each turn; assistant turns are the exact generated text; only complete generations are carried forward; the carried assistant turn is the RAW generated text INCLUDING its think block, which is not stripped)');await mustReset('conversation run '+k);const h=[];const rs=[];
+for(let i=0;i<3&&!stopF;i++){h.push(U(T[i]));const r=await gen('T'+(i+1),h.slice(),true);rs.push(r);
+if(!isComplete(r)){log(`   CONVERSATION RUN ${k} INCOMPLETE: turn ${i+1} status ${r.st}${r.err?' | error: '+r.err:''}. NOT EVALUATED. This run is excluded from context-retention conclusions, later turns were not run, and the raw output is preserved above.`);break}
+h.push(AS(r.txt))}
+if(rs.length===3&&rs.every(isComplete))log('   DIAGNOSTIC keyword indicators only: turn 2 mentions SANVI: '+(/sanvi/i.test(rs[1].ans)?'yes':'no')+'; turn 3 mentions local/offline: '+(/(local|offline)/i.test(rs[2].ans)?'yes':'no')+'. Invented details and recall need human review.')}}),
+m4:()=>mod('4-ContextReuse',async()=>{
+log('FIXED EXECUTION ORDER per sequence: B1 -> B2 -> C2 -> A. Not counterbalanced; this is an exploratory comparison. Sequence 1 may include shader warm-up.');
+log('LABELS: B1 = first turn. B2 = continuing session, no reset. C2 = resetChat() followed by the identical full message history. A = independent short request (a different workload, not a control).');
+log('History note: the assistant turn carried into B2/C2 is the raw B1 text including its think block (not stripped), identical in B2 and C2. Whether the chat template drops earlier think text is UNVERIFIED.');
+log('Complete KV-cache invalidation after resetChat(): UNVERIFIED. C2 is not guaranteed to be a cold-cache condition.');
+for(let k=1;k<=2;k++){if(stopF)break;log('--- sequence '+k);
+let r0=await reset();if(!r0.ok){log('SEQUENCE '+k+' INVALID: resetChat() failed before B1: '+r0.err+'. Test aborted.');return}
+const B1=await gen('B1 turn 1',[U(P)]);if(!isComplete(B1)){log('SEQUENCE '+k+' NOT EVALUATED: B1 status '+B1.st+(B1.err?' | error: '+B1.err:'')+'. B1 output is not carried forward. Test aborted.');return}
+const h=[U(P),AS(B1.txt),U(F)];
+const B2=await gen('B2 continuing session, no reset',h,true);if(!isComplete(B2)){log('SEQUENCE '+k+' NOT EVALUATED: B2 status '+B2.st+(B2.err?' | error: '+B2.err:'')+'. B2/C2 comparison INVALID. Test aborted.');return}
+const r1=await reset();if(!r1.ok){log('B2/C2 COMPARISON INVALID: resetChat() failed before C2: '+r1.err+'. C2 and A not run; test aborted.');return}
+log('   resetChat() before C2 returned without error. This does not prove the KV cache was cleared.');
+const C2=await gen('C2 resetChat() then identical full history',h,true);if(!isComplete(C2)){log('SEQUENCE '+k+' C2 NOT EVALUATED: status '+C2.st+(C2.err?' | error: '+C2.err:'')+'. B2/C2 comparison INVALID. Test aborted.');return}
+log(`   B2/C2 messages array identical as sent: ${B2.mj===C2.mj ? 'yes':'NO, comparison INVALID'} | prompt tokens B2 ${B2.pt}, C2 ${C2.pt}: ${B2.pt===C2.pt?'equal':'DIFFER, not like-for-like'}`);
+const r2=await reset();if(!r2.ok){log('resetChat() failed before A: '+r2.err+'. A not run; test aborted.');return}
+const A=await gen('A independent short request (different workload)',[U(F)]);
+if(!isComplete(A))log('   A NOT EVALUATED: status '+A.st+(A.err?' | error: '+A.err:'')+'. Excluded from the summary; raw output and metrics preserved above.');
+log(`SUMMARY seq ${k} first-content-chunk latency s: B1 ${f(B1.ttft)} | B2 ${f(B2.ttft)} | C2 ${f(C2.ttft)} | A ${isComplete(A)?f(A.ttft):'n/a (NOT EVALUATED)'}. A latency difference is NOT proof of cache reuse.`);
+for(const[n,r]of[['B2',B2],['C2',C2]])log(`INDIRECT ARITHMETIC ${n}: ${r.pt} prompt tokens / B1 prefill ${f(B1.pf,1)} tok/s = ${f(r.pt/B1.pf)} s implied by full prefill at B1's rate; measured first-content-chunk latency ${f(r.ttft)} s. Indirect evidence only. Direct reuse evidence exists only if a cache field was printed above.`)}
+log('REUSE STATUS: UNVERIFIED unless a cache field was printed above.')})};
+['m1','m2','m3','m4'].forEach(k=>$(k).onclick=runs[k]);
+$('all').onclick=async()=>{pinned={mode:$('mode').value,thk:$('thk').value};try{for(const k of['m1','m2','m3','m4']){await runs[k]();if(stopF)break}}finally{pinned=null}};
+$('qsend').onclick=async()=>{const t=$('qin').value.trim();if(!engine||!t)return;if(!targetOk('Quick chat'))return;pick();mid='QuickChat';stopF=false;modMax=0;lock(true);
+log(`\n===== QUICK CHAT | mode ${curMode} (max_tokens ${MODES[curMode].max_tokens}) | independent single turn, resetChat() first | concise-reply system prompt: ${$('qsys').checked?'ON (exact text in MESSAGES below)':'off'} =====`);
+try{await mustReset('quick chat');const ms=[...($('qsys').checked?[{role:'system',content:QSYS}]:[]),U(t)];const r=await gen('Q'+(++qn),ms,true);
+$('qmeta').textContent=`${r.st} | mode ${r.mode} (max_tokens ${r.cap}) | thinking option: ${r.thkLabel} | out ${r.ct} tok (all generated tokens, including any thinking; hiding think text does not reduce this) | first-content-chunk ${f(r.ttft)} s | total ${f(r.tot)} s`;
+$('qans').textContent=r.st==='complete'?r.ans:`INCOMPLETE (${r.st}): not a valid answer. ${r.ans?'Partial visible fragment: '+r.ans:'No visible answer was reached.'}`;$('qraw').textContent=r.txt}
+catch(e){log('QUICK CHAT ERROR: '+e.message);$('qmeta').textContent='ERROR: '+e.message;$('qans').textContent=''}lock(false)};
+$('stop').onclick=()=>{stopF=true;try{engine.interruptGenerate()}catch(e){}};
+$('unl').onclick=async()=>{lock(true);try{await engine.unload();engine=null;loadedId='';log('Model unloaded.')}catch(e){log('UNLOAD ERROR: '+e.message)}lock(false)};
+$('cp').onclick=async()=>{const o=`\n\nOPERATOR OBSERVATIONS (not measurements): charging ${$('o1').value} | heating ${$('o2').value} | freeze/reload ${$('o3').value} | controls usable ${$('o5').value} | background apps ${$('o4').value||'not recorded'} | notes ${$('o6').value||'none'}`;
+const tb=gens.length?'\n\nHUMAN REVIEW TABLE (to be filled in by a person; scores 0/1/2 or N/A, never by this page)\n'+gens.map(g=>g.st==='complete'?`${g.model} | ${g.mid}/${g.id} | mode ${g.mode} (${g.cap}), thinking ${g.thk} | FC __  REL __  COH __  COMP __  INS __ | notes:`:`${g.model} | ${g.mid}/${g.id} | mode ${g.mode} (${g.cap}), thinking ${g.thk} | NOT EVALUATED (status: ${g.st}) | notes:`).join('\n'):'';
+try{await navigator.clipboard.writeText(rep.join('\n')+tb+o);alert('Report copied')}catch(e){alert('Copy failed, select the text manually')}};
+$('load').onclick=async()=>{const m=list[+$('sel').value];lock(true);
+try{if(engine){await engine.unload();engine=null;loadedId=''}log('\nLOADING '+m.model_id+' (catalogue estimate '+Math.round(m.vram_required_MB)+' MB, not measured)');
+const t0=performance.now();engine=await W.CreateMLCEngine(m.model_id,{initProgressCallback:r=>{$('prog').textContent=r.text}});loadedId=m.model_id;log('MODEL LOADED: '+loadedId+' | designated target: '+(TARGETS.includes(loadedId)?'yes':'NO (modules will refuse to run)'));log('Load time: '+f((performance.now()-t0)/1000,1)+' s (includes download if uncached)');
+const nm=new Set();for(let o=Object.getPrototypeOf(engine);o&&o!==Object.prototype;o=Object.getPrototypeOf(o))Object.getOwnPropertyNames(o).forEach(n=>nm.add(n));
+log('ENGINE API (filtered): '+[...nm].filter(n=>/cache|reset|stats|interrupt|unload|prefix|kv|chat|completion/i.test(n)).join(', '))}
+catch(e){engine=null;loadedId='';log('LOAD ERROR (exact): '+e.message)}$('prog').textContent='';lock(false)};
+(async()=>{log('SANVI HW-003c rev 4 | '+new Date().toLocaleString());log('UA: '+navigator.userAgent);
+log('METRIC NOTE: "first-content-chunk latency" is the time from request start to the first streamed chunk that contains text. It is not an exact first-token timestamp. HW-003 and HW-003b used the same measurement under the name "first token".');
+log('HUMAN EVALUATION RUBRIC (fixed before running): score each saved output 0 = fails, 1 = partly, 2 = fully, or N/A, on FC factual correctness, REL relevance, COH coherence, COMP completeness, INS instruction compliance. Keyword and automated checks below are diagnostic indicators only, never quality scores.');
+log('STATUS RULES: only generations that finish with status "complete" are evaluated. "cut at max_tokens" (truncated), "no visible answer" (finished but nothing outside the think block), "ERROR" and "stopped" are NOT EVALUATED: raw output and metrics are kept, but they are not validated, not counted as pass or fail, and never carried into multi-turn or context-reuse conclusions.');
+log(`REV 4 MODES (constants, manual selection only): ${Object.entries(MODES).map(([k,v])=>k+' '+v.max_tokens).join(' | ')}. Default NORMAL. The selected mode's max_tokens is the value passed as max_tokens to every generation in Modules 1-4 and Quick chat (printed on every generation line). Sampling ${JSON.stringify(SAMPLING)} (unchanged from rev 3). Modules 1-4 keep their rev 3 prompts, order and rubric; only the budget is now selectable.`);
+log('WHY THESE BUDGETS: rev 3 used 48-80 and every Qwen3 generation ended inside an unclosed think block (observed). 128/512/2048 are working budgets, not quality targets. A larger budget does NOT imply better answers, and any generation that reaches its budget is still NOT EVALUATED.');
+log('TIME COST (arithmetic from rev 3 observed decode of about 2.7-2.9 tok/s, not a prediction): a generation that runs to its cap takes about cap/2.7 s: 128 = about 47 s, 512 = about 190 s, 2048 = about 760 s (12-13 min). Prefill of longer histories adds time. Whether QUICK_CHAT is fast is UNTESTED on the tablet.');
+log('THINKING CONTROL (read from WebLLM TypeScript declarations on 16 Oct 2026 through a web-fetch tool, in two files; NOT executed on the tablet and not necessarily the build this page loaded): ChatCompletionRequestBase.extra_body.enable_thinking?: boolean|null. Declared doc: "If set to false, prepend a <think>\\n\\n</think>\\n\\n to the response, preventing the model from generating thinking tokens. If set to true or undefined, does nothing. Currently only allowed to be used for Qwen3 models, though not explicitly checked." This page sends it ONLY when Thinking = disable AND the loaded id starts with Qwen3-, and logs every request that sent it. It is OFF by default so default runs stay comparable with rev 3.');
+log('THINKING CONTROL, what is NOT known: whether the build loaded on this tablet honours it (the exact WebLLM version is UNVERIFIED); whether it lowers out tokens or total time (to be measured, never assumed); whether completion_tokens counts the prefixed empty think block. The Qwen3 soft switch /no_think is a prompt-text feature of the model, not a WebLLM API option, and is NOT used here. Hiding think text in a display never reduces generation time or tokens, and this page does not report it as doing so.');
+log('SAMPLING RISK (Qwen3 model card, read 16 Oct 2026): for thinking mode it recommends Temperature 0.6, TopP 0.95, TopK 20, MinP 0 and says "DO NOT use greedy decoding" because of performance degradation and endless repetition. This page keeps temperature 0 (greedy) so rev 4 changes only the budget and the thinking option. A looping generation will show as truncated inside thinking. Changing sampling is a separate, later experiment.');
+log('TARGET GUARD: modules refuse to run unless the loaded model is one of: '+TARGETS.join(', ')+'.');
+if(!navigator.gpu){log('ERROR: WebGPU unavailable');return}const ad=await navigator.gpu.requestAdapter();if(!ad){log('ERROR: no adapter');return}
+const f16=ad.features.has('shader-f16'),i=ad.info||{};log('Adapter: '+[i.vendor,i.architecture].filter(Boolean).join(' / ')+' | shader-f16 '+f16+' | maxStorageBinding '+(ad.limits.maxStorageBufferBindingSize/1048576|0)+' MB');
+const qv=new URLSearchParams(location.search).get('v'),pin=qv&&/^\d+\.\d+\.\d+$/.test(qv)?qv:'';if(qv&&!pin)log('Ignored invalid ?v= value (expected x.y.z).');
+const spec=pin?'@'+pin:'';
+try{W=await import('https://esm.run/@mlc-ai/web-llm'+spec)}catch(e){log('ERROR: WebLLM CDN load failed'+(pin?' (pinned '+pin+')':'')+': '+e.message);return}
+let rv='';try{const r=await fetch('https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm'+spec+'/package.json');if(r.ok)rv=(await r.json()).version||''}catch(e){}
+if(pin)log(`WebLLM pinned via ?v=${pin}. package.json at that pin reports: ${rv||'could not read'}. Compatibility of this pin with the tablet is untested until a run completes.`);
+else log(`Exact WebLLM package version: UNVERIFIED (unpinned import). jsdelivr's current package.json reports ${rv||'(could not read)'} as latest. This is indirect evidence only: the browser may have loaded a different or cached build. Run date ${new Date().toISOString().slice(0,10)}. To pin, reopen this page with ?v=<confirmed version> and reuse the same value for later runs.`);
+list=W.prebuiltAppConfig.model_list.filter(m=>(m.model_type===undefined||m.model_type===0)&&m.vram_required_MB&&m.vram_required_MB<=2600&&(f16||!(m.required_features||[]).includes('shader-f16'))).sort((a,b)=>a.vram_required_MB-b.vram_required_MB);
+for(const t of TARGETS)log('Target model '+t+': '+(list.some(m=>m.model_id===t)?'present in catalogue':'ABSENT from catalogue or filtered out'));
+$('sel').innerHTML=list.map((m,i)=>`<option value="${i}">${m.model_id} | ~${Math.round(m.vram_required_MB)} MB est.</option>`).join('');const qi=list.findIndex(m=>m.model_id===TARGETS[0]);if(qi>=0)$('sel').value=String(qi);log('Dropdown preselected: '+(qi>=0?TARGETS[0]:'none (target absent)')+'. Check the selection before loading.');lock(false)})();
+</script></main></body></html>
